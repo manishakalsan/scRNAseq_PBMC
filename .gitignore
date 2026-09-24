@@ -43,3 +43,15 @@ __pycache__/
 # --- OS / editors ---
 .DS_Store
 .vscode/
+
+# --- Knitting byproducts ---
+*.html
+*.tex
+*.log
+plots/
+
+/.quarto/
+**/*.quarto_ipynb
+!docs/**
+!_freeze/**
+!docs/index.html

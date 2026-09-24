@@ -1,0 +1,26 @@
+project:
+  type: website
+  output-dir: docs
+
+website:
+  title: "scRNA-seq analysis of PBMC3k"
+  navbar:
+    left:
+      - href: index.qmd
+        text: Overview
+      - href: 01_preprocessing.qmd
+        text: "1. QC & preprocessing"
+
+format:
+  html:
+    theme: flatly
+    highlight-style: tango
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    df-print: paged
+
+execute:
+  freeze: auto

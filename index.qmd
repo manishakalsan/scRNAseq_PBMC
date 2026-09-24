@@ -1,0 +1,7 @@
+---
+title: "scRNA-seq analysis of PBMC3k"
+---
+
+Overview of the dataset, the question, and the analysis stages.
+
+- [1. QC & preprocessing](01_preprocessing.qmd)

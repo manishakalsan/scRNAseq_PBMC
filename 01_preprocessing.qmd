@@ -1,0 +1,757 @@
+---
+title: "Single-Cell RNA-seq Preprocessing and Quality Control"
+author: "Manisha Kalsan"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+subtitle: A Worked Example Using the 10x Genomics PBMC 3k Dataset
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5
+)
+```
+
+# Introduction
+
+Single-cell RNA sequencing (scRNA-seq) measures gene expression in individual
+cells rather than averaging expression across a bulk tissue sample. Where
+bulk RNA-seq returns one expression profile per sample, scRNA-seq returns one
+profile *per cell*, typically for thousands to tens of thousands of cells in
+a single experiment. This resolution makes it possible to identify cell
+types and states that would be invisible in bulk data, characterize rare
+populations, trace differentiation trajectories, and study cell-to-cell
+heterogeneity within an otherwise "homogeneous" tissue.
+
+That resolution comes at a cost. Each cell contributes only a small amount of
+RNA, so the resulting count data are noisy, sparse, and subject to technical
+artifacts that bulk RNA-seq does not have to contend with in the same way
+(dropout, variable capture efficiency, ambient RNA contamination, doublets).
+A large fraction of the analytical effort in any scRNA-seq workflow —
+arguably the most consequential fraction, since errors here propagate into
+every downstream result — goes into **preprocessing and quality control**:
+deciding which barcodes represent real cells, which genes are usably
+detected, and how to normalize the resulting count matrix so that
+expression values are comparable across cells.
+
+This document walks through that preprocessing stage end to end, using the
+canonical **PBMC 3k** dataset from 10x Genomics as a worked example. Each
+section pairs a short conceptual explanation of *why* a step is done with
+the runnable R code that does it, so the document can be read either as a
+tutorial on the concepts or as an executable pipeline (or both, which is the
+intent of R Markdown).
+
+## What this document covers
+
+1. The structure of 10x Genomics data and how it is loaded into R
+2. Construction and anatomy of a `Seurat` object
+3. Data exploration: sparsity, distributions of library size and gene detection
+4. Quality-control metrics, in particular mitochondrial and ribosomal content
+5. Statistical vs. literature-based thresholding strategies for filtering
+6. Cell- and gene-level filtering
+7. Two normalization strategies — log-normalization and `SCTransform` — and
+   how their outputs differ
+8. Saving processed objects for downstream analysis (clustering, cell-type
+   annotation, differential expression — not covered here)
+
+This document intentionally stops at the end of preprocessing. Clustering,
+dimensionality reduction, and cell-type annotation are separate stages built
+on top of a properly QC'd and normalized object, and are natural candidates
+for a follow-up document.
+
+## About the dataset
+
+**PBMC 3k** is a peripheral blood mononuclear cell (PBMC) dataset released
+by 10x Genomics as a public demonstration dataset for their Chromium
+single-cell 3' gene expression assay. It contains gene expression
+measurements for approximately 2,700 single cells, sequenced on an Illumina
+platform.
+
+Because PBMCs are a mixture of well-characterized immune cell types (T
+cells, B cells, NK cells, monocytes, dendritic cells) with known marker
+genes, and because the dataset is small enough to process on a laptop, it
+has become the de facto "hello world" dataset for benchmarking and teaching
+single-cell workflows — most single-cell tutorials (including Seurat's own)
+use it for exactly this reason.
+
+Key properties of the raw data:
+
+| Property | Description |
+|---|---|
+| Assay | 10x Genomics Chromium, 3' gene expression |
+| Organism | Human |
+| Tissue | Peripheral blood mononuclear cells (PBMCs) |
+| Cells (raw) | ~2,700 |
+| Format | 10x "filtered" matrix: `barcodes.tsv`, `genes.tsv`/`features.tsv`, `matrix.mtx` |
+| Reference genome | hg19 |
+| Source | [10x Genomics datasets page](https://www.10xgenomics.com/resources/datasets) |
+
+## The 10x Genomics output format
+
+A 10x Chromium run produces, after alignment and cell calling with
+`cellranger`, a sparse count matrix distributed as three files:
+
+- **`matrix.mtx`** — the count matrix itself, stored in MatrixMarket sparse
+  format (only nonzero entries are written to disk, since the vast majority
+  of gene × cell entries are zero)
+- **`barcodes.tsv`** — the cell barcode corresponding to each column of the
+  matrix (one barcode = one droplet =, ideally, one cell)
+- **`genes.tsv` / `features.tsv`** — the gene identifiers corresponding to
+  each row of the matrix
+
+Storing the matrix in sparse form is not a minor implementation detail — it
+is what makes single-cell data tractable at all. A dense matrix for 2,700
+cells × ~32,000 genes would need to hold ~86 million entries; the sparse
+representation only needs to store the nonzero ones, which, as we'll see
+below, is a small fraction of that.
+
+# Environment Setup
+
+```{r libraries}
+# Install required packages (run once; commented out for a reproducible knit)
+# install.packages(c("Seurat", "dplyr", "ggplot2", "patchwork", "Matrix", "RColorBrewer", "reshape2"))
+# install.packages("BiocManager")
+# BiocManager::install(c("SingleCellExperiment", "scater"))
+
+library(Seurat)              # Primary single-cell analysis toolkit
+library(dplyr)                # Data manipulation
+library(ggplot2)              # Plotting
+library(patchwork)            # Combining ggplot objects into panels
+library(Matrix)                # Sparse matrix handling
+library(RColorBrewer)         # Color palettes
+library(reshape2)             # Reshaping data frames for plotting
+
+# Set a random seed for reproducibility. Several downstream steps (e.g.
+# SCTransform's internal subsampling, later clustering/UMAP steps) are
+# stochastic, so fixing the seed makes the analysis re-runnable.
+set.seed(452681)
+```
+
+We use `Seurat`, the most widely adopted R package for single-cell analysis,
+as the primary toolkit. `SingleCellExperiment`/`scater` (Bioconductor's
+alternative container and toolkit) are mentioned in the original script as
+optional companions but are not required for the Seurat-based workflow
+below.
+
+```{r directories}
+# Project directory structure. Adjust base_dir to your own path before knitting.
+base_dir <- "~/Downloads/scrnaseq"
+
+if (!dir.exists(base_dir)) {
+  dir.create(file.path(base_dir, "data"), recursive = TRUE)
+  dir.create(file.path(base_dir, "results"), recursive = TRUE)
+  dir.create(file.path(base_dir, "plots"), recursive = TRUE)
+}
+
+knitr::opts_knit$set(root.dir = base_dir)
+```
+
+# Data Acquisition and Loading
+
+## Downloading the data
+
+The PBMC 3k filtered gene-barcode matrix is publicly hosted by 10x Genomics.
+It is downloaded once and cached locally rather than re-fetched on every
+knit.
+
+```{r download, eval=FALSE}
+# Source: 10x Genomics public datasets
+url <- "https://cf.10xgenomics.com/samples/cell/pbmc3k/pbmc3k_filtered_gene_bc_matrices.tar.gz"
+download_path <- file.path(base_dir, "pbmc3k_filtered_gene_bc_matrices.tar.gz")
+
+if (!file.exists(download_path)) {
+  download.file(url, destfile = download_path, mode = "wb")
+}
+
+# Extract into the data/ directory
+untar(download_path, exdir = file.path(base_dir, "data"))
+```
+
+## Loading a 10x matrix into R
+
+`Seurat::Read10X()` reads the three-file 10x format described above and
+assembles it into a single sparse matrix (an object of class `dgCMatrix`),
+with gene symbols as row names and cell barcodes as column names.
+
+```{r load_data}
+pbmc.data <- Read10X(data.dir = file.path(base_dir, "data", "filtered_gene_bc_matrices", "hg19"))
+
+cat("Dataset dimensions:", dim(pbmc.data), "\n")
+cat("Data type:", class(pbmc.data), "\n")
+cat("First few gene names:", head(rownames(pbmc.data)), "\n")
+cat("First few barcodes:", head(colnames(pbmc.data)), "\n")
+```
+
+## Why sparsity matters
+
+In a typical droplet-based scRNA-seq experiment, the majority of gene ×
+cell entries in the count matrix are zero. This is partly biological (most
+genes are not expressed in most cell types at any given time) and partly
+technical — a phenomenon usually called **dropout**: a transcript that is
+genuinely present in the cell but is not captured, reverse-transcribed, or
+sequenced deeply enough to be detected. Distinguishing "true zero" from
+"dropout zero" is impossible at the level of a single entry, and this
+ambiguity is one of the central statistical challenges in scRNA-seq analysis
+(it motivates, among other things, the imputation and modeling choices in
+methods like `SCTransform`, discussed later).
+
+```{r sparsity_check}
+non_zero_pct <- round(100 * sum(pbmc.data > 0) / (nrow(pbmc.data) * ncol(pbmc.data)), 2)
+cat("Percentage of non-zero entries in the raw matrix:", non_zero_pct, "%\n")
+```
+
+Storing this matrix in sparse format (rather than as a dense matrix) is what
+keeps memory usage manageable — the object only stores the coordinates and
+values of nonzero entries.
+
+# Creating the Seurat Object
+
+A `Seurat` object is the central data structure used throughout the
+workflow. It bundles together the raw count matrix, per-cell metadata
+(library size, number of genes detected, and anything else computed later
+such as QC metrics or cluster assignments), and, as the analysis proceeds,
+normalized data, scaled data, dimensionality-reduction embeddings, and
+nearest-neighbor graphs — all addressable through one object rather than as
+separate, easily-desynchronized variables.
+
+At creation time, two basic filters are already applied:
+
+- **`min.cells = 3`**: a gene is kept only if it is detected (count > 0) in
+  at least 3 cells. Genes detected in fewer cells than this are almost
+  always uninformative noise and needlessly inflate the feature space.
+- **`min.features = 200`**: a cell (barcode) is kept only if at least 200
+  genes are detected in it. Barcodes with very few detected genes are
+  usually empty droplets or fragments of lysed cells rather than intact
+  single cells.
+
+These are coarse, standard defaults intended to remove obviously unusable
+barcodes/genes before any more principled QC is applied — they are not a
+substitute for the QC step in the next section.
+
+```{r create_seurat}
+pbmc <- CreateSeuratObject(
+  counts = pbmc.data,
+  project = "pbmc3k",
+  min.cells = 3,
+  min.features = 200
+)
+
+cat("Number of cells retained:", ncol(pbmc), "\n")
+cat("Number of genes retained:", nrow(pbmc), "\n")
+```
+
+## Automatically computed metadata
+
+On creation, Seurat automatically computes two metrics for every cell:
+
+- **`nCount_RNA`** — total UMI (Unique Molecular Identifier) count for the
+  cell, i.e. total library size. UMIs are short random sequences attached
+  to each transcript molecule before amplification, which let Seurat
+  distinguish independent transcript molecules from PCR duplicates of the
+  same molecule — this is why scRNA-seq counts are described as UMI counts
+  rather than raw reads.
+- **`nFeature_RNA`** — number of distinct genes detected (count > 0) in the
+  cell.
+
+```{r inspect_metadata}
+head(pbmc@meta.data)
+
+summary(pbmc$nCount_RNA)
+summary(pbmc$nFeature_RNA)
+```
+
+These two numbers are the foundation of the QC step below: cells with
+implausibly low values of either are usually not intact single cells, and
+cells with implausibly high values are often doublets (two or more cells
+captured in a single droplet and sequenced together as one barcode).
+
+# Exploring Single-Cell Data Characteristics
+
+Before doing any filtering or normalization, it is worth building intuition
+for what makes single-cell count data different from bulk RNA-seq data,
+since every preprocessing decision downstream is a response to one of these
+properties.
+
+Single-cell count data are characterized by:
+
+1. **Sparsity** — most gene/cell entries are zero (shown above)
+2. **High cell-to-cell variability** — even cells of the same type differ in
+   library size and detected gene count, partly biology, partly technical
+   variation in capture efficiency
+3. **Technical noise** — amplification bias, batch effects, and
+   sequencing depth all affect the observed counts independently of true
+   expression
+4. **Dropout** — false zeros, as discussed above
+
+```{r gene_sparsity}
+gene_sparsity <- apply(pbmc.data, 1, function(x) sum(x == 0) / length(x))
+
+cat("Average gene sparsity (fraction of zero entries):",
+    round(mean(gene_sparsity), 3), "\n")
+
+highly_sparse_genes     <- names(gene_sparsity[gene_sparsity > 0.95])
+moderately_sparse_genes <- names(gene_sparsity[gene_sparsity > 0.5 & gene_sparsity <= 0.95])
+lowly_sparse_genes      <- names(gene_sparsity[gene_sparsity <= 0.5])
+
+cat("Highly sparse genes   (>95% zeros):", length(highly_sparse_genes), "\n")
+cat("Moderately sparse genes (50-95%):",   length(moderately_sparse_genes), "\n")
+cat("Lowly sparse genes    (<50% zeros):", length(lowly_sparse_genes), "\n")
+```
+
+Most genes fall into the "highly sparse" bucket. This is expected: any given
+cell type only actively transcribes a subset of the genome, and PBMCs
+comprise several distinct cell types, so genes specific to one lineage will
+read as zero in all the others.
+
+## Visualizing basic distributions
+
+```{r basic_viz}
+p1 <- ggplot(pbmc@meta.data, aes(x = nCount_RNA)) +
+  geom_histogram(bins = 50, fill = "lightblue", color = "black", alpha = 0.7) +
+  labs(title = "Distribution of UMI Counts per Cell",
+       x = "Total UMI Counts", y = "Number of Cells") +
+  theme_minimal()
+
+p2 <- ggplot(pbmc@meta.data, aes(x = nFeature_RNA)) +
+  geom_histogram(bins = 50, fill = "lightcoral", color = "black", alpha = 0.7) +
+  labs(title = "Distribution of Genes Detected per Cell",
+       x = "Number of Genes", y = "Number of Cells") +
+  theme_minimal()
+
+p3 <- ggplot(pbmc@meta.data, aes(x = nCount_RNA, y = nFeature_RNA)) +
+  geom_point(alpha = 0.6, color = "darkgreen") +
+  labs(title = "UMI Counts vs Genes Detected",
+       x = "Total UMI Counts", y = "Number of Genes Detected") +
+  theme_minimal()
+
+p1
+p2
+p3
+
+ggsave(file.path(base_dir, "plots", "umi_distribution.png"), p1, width = 8, height = 6)
+ggsave(file.path(base_dir, "plots", "gene_distribution.png"), p2, width = 8, height = 6)
+ggsave(file.path(base_dir, "plots", "counts_vs_genes.png"), p3, width = 8, height = 6)
+
+print(p1)
+print(p2)
+print(p3)
+```
+
+The positive, roughly linear relationship between UMI counts and genes
+detected (Plot 3) is expected under normal conditions — cells sequenced more
+deeply will, on average, have more genes detected simply because there is
+more opportunity to detect each one. Deviations from this relationship (a
+cell with very high UMI counts but a disproportionately *low* number of
+genes detected, for instance) are one of the signatures used to flag
+doublets or damaged cells.
+
+```{r save_raw}
+saveRDS(pbmc, file.path(base_dir, "data", "pbmc3k.rds"))
+```
+
+---
+
+# Quality Control and Preprocessing
+
+With the raw object built and its general character understood, we now
+compute the metrics used to decide which cells (and, later, which genes)
+should be retained for downstream analysis.
+
+## Why mitochondrial content matters
+
+Cells that are dying, ruptured, or otherwise stressed tend to lose
+cytoplasmic mRNA through membrane damage while retaining mitochondrial mRNA
+somewhat longer, because mitochondria are membrane-bound organelles. The
+practical consequence is that a **high proportion of a cell's transcripts
+mapping to mitochondrial genes** is a strong signal of a low-quality or
+dying cell rather than a genuine biological state (with a few
+tissue-specific exceptions, e.g. cardiomyocytes, which are not relevant to
+PBMCs). Human mitochondrial genes are conventionally identified by the
+`MT-` gene symbol prefix.
+
+Ribosomal gene content (`RPS`/`RPL` prefixes) is tracked as a secondary,
+optional QC signal — it is more informative as a marker of cell-type-specific
+translational activity than of cell viability, but unusually low or
+unusually high values can still flag technical issues.
+
+```{r qc_reload}
+pbmc <- readRDS(file.path(base_dir, "data", "pbmc3k.rds"))
+cat("Loaded PBMC dataset with", ncol(pbmc), "cells and", nrow(pbmc), "genes\n")
+```
+
+```{r qc_metrics}
+# Percentage of counts mapping to mitochondrial genes
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^MT-")
+
+# Percentage of counts mapping to ribosomal genes (secondary QC signal)
+pbmc[["percent.ribo"]] <- PercentageFeatureSet(pbmc, pattern = "^RP[SL]")
+
+head(pbmc@meta.data)
+```
+
+## Visualizing QC metrics
+
+Violin plots show the distribution of each metric across all cells; scatter
+plots reveal relationships between metrics that a single-metric view would
+miss (e.g., whether high mitochondrial content is concentrated among
+low-library-size cells).
+
+```{r qc_viz, fig.width=10}
+p1 <- VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+              ncol = 3, pt.size = 0.1)
+p1
+
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+  labs(title = "UMI Counts vs Mitochondrial Percentage")
+
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+  labs(title = "UMI Counts vs Genes Detected")
+
+combined_scatter <- plot1 + plot2
+combined_scatter
+
+ggsave(file.path(base_dir, "plots", "qc_violin.png"), p1, width = 12, height = 6)
+ggsave(file.path(base_dir, "plots", "qc_scatter.png"), combined_scatter, width = 12, height = 6)
+```
+
+## Setting filtering thresholds
+
+There are two broad philosophies for choosing QC thresholds, and the code
+below demonstrates both so they can be compared.
+
+**1. Statistical / data-driven thresholding.** Compute a robust measure of
+central tendency and spread for each metric — the median and the **median
+absolute deviation (MAD)** rather than the mean and standard deviation,
+because MAD is far less sensitive to the extreme outliers that scRNA-seq QC
+metrics routinely contain — and flag cells beyond some multiple of MAD from
+the median (3 MAD is a common convention, roughly analogous to a
+z-score cutoff but robust to outliers).
+
+**2. Literature-based / conventional thresholding.** Use fixed, commonly
+cited cutoffs from the literature and from widely used tutorials (e.g. the
+original Seurat PBMC3k vignette): `nFeature_RNA` between 200 and 2500, and
+`percent.mt` below 20%. These are less tailored to the specific dataset but
+are simple, well-precedented, and easy to communicate.
+
+Neither approach is objectively "correct" — the data-driven approach adapts
+to the specific sample but can be thrown off by a dataset that genuinely
+contains many low-quality cells (inflating the MAD and loosening the
+threshold accordingly); the literature-based approach is stable but was
+calibrated on other datasets and assays. In practice, both are computed and
+compared, and the final choice is a judgment call cross-checked against the
+QC plots above.
+
+```{r qc_summary_print}
+cat("nFeature_RNA summary:\n")
+print(summary(pbmc$nFeature_RNA))
+
+cat("\nnCount_RNA summary:\n")
+print(summary(pbmc$nCount_RNA))
+
+cat("\npercent.mt summary:\n")
+print(summary(pbmc$percent.mt))
+```
+
+```{r mad_thresholds}
+# --- Statistical thresholds (median +/- 3 MAD) ---
+feature_median <- median(pbmc$nFeature_RNA)
+feature_mad    <- mad(pbmc$nFeature_RNA)
+feature_lower  <- feature_median - 3 * feature_mad
+feature_upper  <- feature_median + 3 * feature_mad
+
+mt_median <- median(pbmc$percent.mt)
+mt_mad    <- mad(pbmc$percent.mt)
+mt_upper  <- mt_median + 3 * mt_mad
+
+cat("Proposed filtering thresholds (median +/- 3 MAD):\n")
+cat("nFeature_RNA: ", feature_lower, "-", feature_upper, "\n")
+cat("percent.mt:   <", mt_upper, "\n")
+
+# --- Literature-based / conventional thresholds ---
+cat("\nAlternative thresholds (literature-based, Seurat PBMC3k convention):\n")
+cat("nFeature_RNA: 200-2500\n")
+cat("nCount_RNA:   1000-30000\n")
+cat("percent.mt:   <20%\n")
+```
+
+## Applying the filters
+
+We proceed with the literature-based thresholds, since they are the more
+widely used convention for this exact dataset/assay combination and keep
+the results comparable to other PBMC3k analyses.
+
+```{r apply_cell_filter}
+original_cell_count <- ncol(pbmc)
+
+pbmc_filtered <- subset(
+  pbmc,
+  subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 20
+)
+
+filtered_cell_count <- ncol(pbmc_filtered)
+
+cat("=== CELL FILTERING RESULTS ===\n")
+cat("Original cell count: ", original_cell_count, "\n")
+cat("Filtered cell count:  ", filtered_cell_count, "\n")
+cat("Cells removed:        ", original_cell_count - filtered_cell_count, "\n")
+cat("Percentage retained:  ",
+    round(100 * filtered_cell_count / original_cell_count, 2), "%\n")
+```
+
+## Gene-level filtering
+
+The `min.cells = 3` filter at object creation used the *unfiltered* cell
+population. After removing low-quality cells, it is good practice to
+re-check gene detection rates, since a gene that only appeared "detected in
+enough cells" because of low-quality cells should be re-evaluated on the
+cleaned population.
+
+```{r gene_filter}
+min_cells <- 3
+
+counts_mat <- pbmc_filtered[["RNA"]]@layers[["counts"]]
+genes_before <- nrow(counts_mat)
+
+# Recover gene names on the counts layer if they were dropped (Seurat v5 Assay5 quirk)
+if (is.null(rownames(counts_mat))) {
+  rn <- tryCatch(Features(pbmc_filtered, assay = "RNA"), error = function(e) NULL)
+  if (is.null(rn)) stop("No gene names found: rownames(counts) and Features() are both NULL.")
+  rownames(counts_mat) <- rn
+}
+
+gene_counts <- Matrix::rowSums(counts_mat > 0)
+keep_genes  <- names(gene_counts[gene_counts >= min_cells])
+
+pbmc_filtered <- subset(pbmc_filtered, features = keep_genes)
+genes_after <- length(keep_genes)
+
+cat("=== GENE FILTERING RESULTS ===\n")
+cat("Original gene count: ", genes_before, "\n")
+cat("Filtered gene count:  ", genes_after, "\n")
+cat("Genes removed:        ", genes_before - genes_after, "\n")
+```
+
+# Normalization
+
+## Why normalize at all
+
+Raw UMI counts are not directly comparable between cells, because two cells
+expressing a gene at the same *true* level can produce very different raw
+counts simply due to differences in sequencing depth (total UMIs captured
+per cell). Normalization aims to remove this technical, depth-driven
+variation so that differences in expression values between cells reflect
+biology rather than how deeply each cell happened to be sequenced.
+
+Two conceptually different normalization strategies are demonstrated here.
+
+### Method 1 — Log-normalization
+
+The traditional approach: scale each cell's counts by its total UMI count,
+multiply by a constant scale factor (10,000 by convention, chosen simply to
+bring values into a convenient range), and log-transform (`log1p`, i.e.
+`log(1 + x)`, to handle zeros):
+
+$$
+x_{ij}^{\text{norm}} = \log\left(1 + \frac{x_{ij}}{\sum_j x_{ij}} \times 10{,}000\right)
+$$
+
+where \(x_{ij}\) is the raw count of gene \(i\) in cell \(j\). This is fast,
+simple, and the historical default, but it treats every cell's total count
+as an equally reliable estimate of sequencing depth and does not explicitly
+model the count distribution's variance structure.
+
+```{r log_normalize}
+pbmc_log <- pbmc_filtered
+pbmc_log <- NormalizeData(pbmc_log, normalization.method = "LogNormalize",
+                          scale.factor = 10000)
+cat("Log-normalization completed.\n")
+```
+
+### Method 2 — SCTransform
+
+`SCTransform` takes a model-based approach: it fits a **regularized
+negative binomial regression** of each gene's counts against sequencing
+depth across all cells, pooling information across genes to regularize the
+per-gene model parameters (since fitting each gene's model independently
+would be noisy for lowly-expressed genes). The Pearson residuals from this
+model — the deviation of each observed count from what the depth-based
+model predicts — are used as the normalized expression values.
+
+This has two practical advantages over log-normalization: it does not
+require a separate downstream step to identify highly variable genes (the
+model naturally highlights genes whose variance exceeds what sequencing
+depth alone would predict), and it tends to better stabilize variance across
+the full range of expression levels, including for lowly-expressed genes
+where log-normalization is known to under- or over-correct. The tradeoff is
+computational cost and, for some users, reduced interpretability of the
+resulting values relative to a straightforward log ratio.
+
+```{r sctransform}
+pbmc_sct <- pbmc_filtered
+pbmc_sct <- SCTransform(pbmc_sct, verbose = FALSE)
+cat("SCTransform normalization completed.\n")
+```
+
+## Comparing the two methods
+
+As a concrete illustration, we compare raw, log-normalized, and
+SCTransform-normalized values for **CD3D**, a canonical marker of T cells
+and one of the more variably expressed genes in a PBMC population — a good
+stress test for how each method handles a gene with real biological
+heterogeneity across cell types.
+
+```{r compare_normalization}
+if ("CD3D" %in% rownames(pbmc_filtered[["RNA"]])) {
+
+  raw_counts <- GetAssayData(pbmc_filtered, assay = "RNA", layer = "counts")["CD3D", ]
+  log_norm   <- GetAssayData(pbmc_log, assay = "RNA", layer = "data")["CD3D", ]
+  sct_norm   <- pbmc_sct@assays$SCT@data["CD3D", ]
+
+  norm_comparison <- data.frame(
+    Raw         = as.numeric(raw_counts),
+    LogNorm     = as.numeric(log_norm),
+    SCTransform = as.numeric(sct_norm)
+  )
+
+  # Drop cells where the gene is undetected under every method
+  norm_comparison <- norm_comparison[rowSums(norm_comparison) > 0, ]
+
+  norm_long <- melt(norm_comparison)
+
+  p_norm_comparison <- ggplot(norm_long, aes(x = variable, y = value, fill = variable)) +
+    geom_boxplot() +
+    labs(title = "CD3D Expression: Normalization Method Comparison",
+         x = "Normalization Method", y = "Expression Value") +
+    theme_minimal() +
+    theme(legend.position = "none")
+
+  p_norm_comparison
+
+  ggsave(file.path(base_dir, "plots", "normalization_comparison.png"),
+         p_norm_comparison, width = 8, height = 6)
+}
+```
+
+Raw counts and the two normalized versions live on different scales by
+construction, so the comparison above is about *shape* (spread, skew,
+separation between expressing and non-expressing cells) rather than absolute
+magnitude — a well-behaved normalization should compress the extreme
+right-skew of the raw counts while still preserving the separation between
+CD3D-high (T cell) and CD3D-low/absent (everything else) cells.
+
+# Before/After Filtering Comparison
+
+To make the effect of the QC filtering step visible rather than just
+numeric, we recombine the pre- and post-filtering metadata into a single
+data frame and re-plot the UMI-vs-gene relationship, colored by
+mitochondrial percentage, faceted by filtering status.
+
+```{r before_after_viz, fig.width=10}
+pbmc$filter_status          <- "Original"
+pbmc_filtered$filter_status <- "Filtered"
+
+combined_metadata <- rbind(
+  cbind(pbmc@meta.data[, c("nFeature_RNA", "nCount_RNA", "percent.mt")],
+        Status = "Before Filtering"),
+  cbind(pbmc_filtered@meta.data[, c("nFeature_RNA", "nCount_RNA", "percent.mt")],
+        Status = "After Filtering")
+)
+
+p_before_after <- ggplot(combined_metadata,
+                          aes(x = nCount_RNA, y = nFeature_RNA, color = percent.mt)) +
+  geom_point(alpha = 0.6) +
+  scale_color_gradient(low = "blue", high = "red", name = "% MT") +
+  facet_wrap(~Status) +
+  labs(title = "Quality Control: Before vs After Filtering",
+       x = "Total UMI Counts", y = "Number of Genes Detected") +
+  theme_minimal()
+
+p_before_after
+
+ggsave(file.path(base_dir, "plots", "before_after_filtering.png"),
+       p_before_after, width = 12, height = 6)
+```
+
+The cells removed by filtering should visibly concentrate at the low end of
+`nFeature_RNA`/`nCount_RNA` (likely empty droplets or debris) and at the
+high-`percent.mt` end (likely dying or damaged cells) — if instead the
+filtered-out cells look scattered randomly through the plot, that's a sign
+the chosen thresholds may not be well matched to this dataset's actual
+quality distribution and are worth revisiting.
+
+# Saving Processed Outputs
+
+Each object represents a different point in the preprocessing pipeline and
+is saved separately so that downstream analyses (clustering, marker
+detection, etc.) can start from whichever normalization is appropriate
+without re-running QC from scratch.
+
+```{r save_outputs}
+saveRDS(pbmc_filtered, file.path(base_dir, "data", "pbmc_filtered.rds"))
+saveRDS(pbmc_log,      file.path(base_dir, "data", "pbmc_log_normalized.rds"))
+saveRDS(pbmc_sct,      file.path(base_dir, "data", "pbmc_sct_normalized.rds"))
+
+qc_summary <- data.frame(
+  Metric = c("Original Cells", "Filtered Cells", "Cells Removed", "Retention Rate (%)",
+             "Original Genes", "Filtered Genes", "Genes Removed"),
+  Value = c(original_cell_count, filtered_cell_count,
+            original_cell_count - filtered_cell_count,
+            round(100 * filtered_cell_count / original_cell_count, 2),
+            genes_before, genes_after, genes_before - genes_after)
+)
+
+write.csv(qc_summary, file.path(base_dir, "results", "qc_summary.csv"), row.names = FALSE)
+
+knitr::kable(qc_summary, caption = "Summary of QC filtering results")
+```
+
+```{r final_message, echo=FALSE}
+cat("Key files created:\n")
+cat("-", file.path(base_dir, "data", "pbmc_filtered.rds"), "\n")
+cat("-", file.path(base_dir, "data", "pbmc_log_normalized.rds"), "\n")
+cat("-", file.path(base_dir, "data", "pbmc_sct_normalized.rds"), "\n")
+cat("-", file.path(base_dir, "plots"), "/*.png\n")
+cat("-", file.path(base_dir, "results", "qc_summary.csv"), "\n")
+```
+
+# Summary and Next Steps
+
+At this point the pipeline has produced three saved `Seurat` objects, all
+built on the same QC-filtered set of cells and genes but carrying different
+normalizations:
+
+- `pbmc_filtered.rds` — QC-filtered, **not yet normalized** (raw counts only)
+- `pbmc_log_normalized.rds` — log-normalized (`RNA` assay, `data` layer)
+- `pbmc_sct_normalized.rds` — SCTransform-normalized (`SCT` assay)
+
+Either normalized object is a valid starting point for the next stage of a
+standard scRNA-seq workflow, which is not covered in this document:
+
+1. **Feature selection** — identifying highly variable genes to focus
+   downstream steps on the genes carrying the most biological signal
+2. **Dimensionality reduction** — PCA (and, for visualization, UMAP/t-SNE)
+   to compress the noisy, high-dimensional expression matrix into a
+   tractable number of components
+3. **Clustering** — grouping cells into putative cell populations based on
+   similarity in the reduced-dimensional space (typically graph-based
+   clustering, e.g. Louvain/Leiden on a shared-nearest-neighbor graph)
+4. **Cell type annotation** — assigning biological identity to each cluster
+   using canonical marker genes or reference-based label transfer
+5. **Differential expression** — comparing expression between clusters or
+   conditions to identify marker genes or condition-specific responses
+
+Each of these steps depends critically on the QC and normalization
+decisions made above — an under-filtered or poorly normalized input
+propagates errors into every subsequent step — which is why this stage,
+despite producing no biological "results" of its own, is treated as
+foundational rather than a formality.
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
